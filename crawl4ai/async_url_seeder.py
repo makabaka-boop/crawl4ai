@@ -176,6 +176,49 @@ def _write_cache(
         pass  # Fail silently - cache is optional
 
 
+def _read_sub_sitemap_cache(cache_path: pathlib.Path) -> Optional[Dict[str, Any]]:
+    """
+    Read a per-sub-sitemap cache entry.
+
+    Returns None when the file is missing/corrupt or has an unsupported version.
+    A cached empty URL list is a valid hit (represented as {"urls": []}), so the
+    return value must be checked with `is not None`, not by truthiness.
+    """
+    try:
+        with open(cache_path, "r") as f:
+            data = json.load(f)
+        if data.get("version") != 1 or not isinstance(data.get("urls"), list):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _write_sub_sitemap_cache(
+    cache_path: pathlib.Path,
+    sub_sitemap_url: str,
+    urls: List[str],
+    etag: Optional[str],
+    last_modified: Optional[str],
+) -> None:
+    """Persist a sub-sitemap's URL list together with its HTTP validators."""
+    data = {
+        "version": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "url": sub_sitemap_url,
+        "etag": etag,
+        "last_modified": last_modified,
+        "url_count": len(urls),
+        "urls": urls,
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # Cache is optional; discovery must work without it
+
+
 def _match(url: str, pattern: str) -> bool:
     if fnmatch.fnmatch(url, pattern):
         return True
@@ -400,6 +443,8 @@ class AsyncUrlSeeder:
         # Store cache config for use in _from_sitemaps
         self._cache_ttl_hours = getattr(config, 'cache_ttl_hours', 24)
         self._validate_sitemap_lastmod = getattr(config, 'validate_sitemap_lastmod', True)
+        self._sitemap_conditional_refresh = getattr(config, 'sitemap_conditional_refresh', False)
+        self._seed_concurrency = concurrency
 
         # Ensure seeder's logger verbose matches the config's verbose if it's set
         if self.logger and hasattr(self.logger, 'verbose') and config.verbose is not None:
@@ -899,6 +944,7 @@ class AsyncUrlSeeder:
         # Get config values (passed via self during urls() call)
         cache_ttl_hours = getattr(self, '_cache_ttl_hours', 24)
         validate_lastmod = getattr(self, '_validate_sitemap_lastmod', True)
+        conditional_refresh = getattr(self, '_sitemap_conditional_refresh', False)
 
         # Cache file path (new format: .json instead of .jsonl)
         host = re.sub(r'^https?://', '', domain).rstrip('/')
@@ -940,6 +986,42 @@ class AsyncUrlSeeder:
             if sitemap_url:
                 break
 
+        # Step 1b: Conditional refresh mode — the index is re-read on every run
+        # and its currently-listed children are revalidated with ETag /
+        # Last-Modified conditional requests, so child updates surface without
+        # waiting for the aggregate TTL cache to expire (and without
+        # re-downloading every child like force=True does).
+        if conditional_refresh and sitemap_url and sitemap_content:
+            index_children: List[str] = []
+            try:
+                index_data = (gzip.decompress(sitemap_content)
+                              if sitemap_url.endswith(".gz") else sitemap_content)
+                index_children, _ = self._parse_sitemap_entries(index_data, sitemap_url)
+            except Exception as e:
+                self._log("warning",
+                          "Failed to parse sitemap index {url} for conditional refresh: {error}",
+                          params={"url": sitemap_url, "error": str(e)}, tag="URL_SEED")
+
+            if index_children:
+                self._log("info", "Found sitemap index at {url}",
+                          params={"url": sitemap_url}, tag="URL_SEED")
+                discovered_urls = []
+                async for u in self._from_sitemap_index_conditional(
+                        sitemap_url, index_children, force):
+                    discovered_urls.append(u)
+                    if _match(u, pattern):
+                        yield u
+
+                # Refresh the aggregate cache too, so non-conditional runs and
+                # lastmod-based validation keep working with the merged result.
+                if discovered_urls:
+                    _write_cache(cache_path, discovered_urls,
+                                 sitemap_url or "", sitemap_lastmod)
+                    self._log("info", "Cached {count} URLs for {d}",
+                              params={"count": len(discovered_urls), "d": domain},
+                              tag="URL_SEED")
+                return
+
         # Step 2: Check cache validity (skip if force=True)
         if not force and cache_path.exists():
             if _is_cache_valid(cache_path, cache_ttl_hours, validate_lastmod, sitemap_lastmod):
@@ -968,10 +1050,16 @@ class AsyncUrlSeeder:
         elif sitemap_url:
             # We have a sitemap URL but no content (fetch failed earlier), try again
             self._log("info", "Found sitemap at {url}", params={"url": sitemap_url}, tag="URL_SEED")
-            async for u in self._iter_sitemap(sitemap_url):
-                discovered_urls.append(u)
-                if _match(u, pattern):
-                    yield u
+            if conditional_refresh:
+                async for u in self._discover_sitemap_urls_conditional(sitemap_url, force):
+                    discovered_urls.append(u)
+                    if _match(u, pattern):
+                        yield u
+            else:
+                async for u in self._iter_sitemap(sitemap_url):
+                    discovered_urls.append(u)
+                    if _match(u, pattern):
+                        yield u
         else:
             # Fallback: robots.txt
             robots = f"https://{host}/robots.txt"
@@ -982,10 +1070,16 @@ class AsyncUrlSeeder:
                                      for l in r.text.splitlines()
                                      if l.lower().startswith("sitemap:")]
                     for sm in sitemap_lines:
-                        async for u in self._iter_sitemap(sm):
-                            discovered_urls.append(u)
-                            if _match(u, pattern):
-                                yield u
+                        if conditional_refresh:
+                            async for u in self._discover_sitemap_urls_conditional(sm, force):
+                                discovered_urls.append(u)
+                                if _match(u, pattern):
+                                    yield u
+                        else:
+                            async for u in self._iter_sitemap(sm):
+                                discovered_urls.append(u)
+                                if _match(u, pattern):
+                                    yield u
                 else:
                     self._log("warning", "robots.txt unavailable for {d} HTTP{c}",
                               params={"d": domain, "c": r.status_code}, tag="URL_SEED")
@@ -1280,6 +1374,259 @@ class AsyncUrlSeeder:
         else:
             # Regular sitemap - yield URLs directly
             for u in regular_urls:
+                yield u
+
+    # ─────────── conditional per-sub-sitemap refresh (sitemap indexes) ───────
+    @staticmethod
+    def _parse_sitemap_entries(data: bytes, base_url: str):
+        """
+        Parse a sitemap document into ``(sub_sitemaps, page_urls)``.
+
+        ``sub_sitemaps`` lists the <loc> entries of a sitemap index; when the
+        document is a regular urlset it is empty and ``page_urls`` holds the
+        page URLs. Parsing is namespace-agnostic, matching _iter_sitemap.
+
+        Raises ValueError (or xml.etree.ElementTree.ParseError) when the
+        document cannot be parsed, so callers can distinguish a download/parse
+        failure from a legitimately empty urlset.
+        """
+        def _normalize_loc(raw: Optional[str]) -> Optional[str]:
+            if not raw:
+                return None
+            cleaned = raw.strip().replace("\u200b", "").replace("\ufeff", "")
+            normalized = urljoin(base_url, cleaned)
+            return normalized or None
+
+        if LXML:
+            parser = etree.XMLParser(recover=True)
+            root = etree.fromstring(data, parser=parser)
+            if root is None:
+                raise ValueError("empty or unparseable sitemap document")
+
+            sub_sitemaps = [
+                loc for loc in (
+                    _normalize_loc(el.text)
+                    for el in root.xpath(
+                        "//*[local-name()='sitemap']/*[local-name()='loc']")
+                ) if loc
+            ]
+            page_urls: List[str] = []
+            if not sub_sitemaps:
+                page_urls = [
+                    loc for loc in (
+                        _normalize_loc(el.text)
+                        for el in root.xpath(
+                            "//*[local-name()='url']/*[local-name()='loc']")
+                    ) if loc
+                ]
+            return sub_sitemaps, page_urls
+
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(data)  # raises ParseError on malformed input
+        for elem in root.iter():
+            if '}' in elem.tag:
+                elem.tag = elem.tag.split('}')[1]
+
+        sub_sitemaps = []
+        page_urls = []
+        sitemaps = root.findall('.//sitemap')
+        if sitemaps:
+            for sitemap in sitemaps:
+                loc_elem = sitemap.find('loc')
+                loc = _normalize_loc(
+                    loc_elem.text if loc_elem is not None else None)
+                if loc:
+                    sub_sitemaps.append(loc)
+        else:
+            for url_elem in root.findall('.//url'):
+                loc_elem = url_elem.find('loc')
+                loc = _normalize_loc(
+                    loc_elem.text if loc_elem is not None else None)
+                if loc:
+                    page_urls.append(loc)
+        return sub_sitemaps, page_urls
+
+    def _sub_sitemap_cache_dir(self, index_url: str) -> Path:
+        """Directory holding per-child caches for one sitemap index."""
+        host = re.sub(r'^https?://', '', index_url).split('/', 1)[0]
+        host_safe = re.sub('[/?#]+', '_', host)
+        index_digest = hashlib.sha1(index_url.encode()).hexdigest()[:12]
+        path = self.cache_dir / "sitemap_conditional" / f"{host_safe}_{index_digest}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _sub_sitemap_cache_file(cache_dir: Path, sub_sitemap_url: str) -> Path:
+        digest = hashlib.sha1(sub_sitemap_url.encode()).hexdigest()
+        return cache_dir / f"{digest}.json"
+
+    async def _refresh_sub_sitemap(
+        self,
+        sub_sitemap_url: str,
+        cache_path: Path,
+        force: bool = False,
+    ) -> List[str]:
+        """
+        Fetch one child sitemap using HTTP conditional requests.
+
+        * With a cached ETag/Last-Modified, sends If-None-Match /
+          If-Modified-Since (skipped entirely when force=True).
+        * 304 → the cached URL list (which may itself be empty) is reused.
+        * 200 → the freshly parsed list replaces the old one wholesale,
+          even when the new list is empty.
+        * Download/parse failure → a warning is logged and the previous list
+          is reused when available; otherwise the child contributes nothing.
+        """
+        cached: Optional[Dict[str, Any]] = None
+        if not force:
+            cached = _read_sub_sitemap_cache(cache_path)
+
+        headers: Dict[str, str] = {}
+        if cached is not None:
+            if cached.get("etag"):
+                headers["If-None-Match"] = cached["etag"]
+            if cached.get("last_modified"):
+                headers["If-Modified-Since"] = cached["last_modified"]
+
+        try:
+            response = await self.client.get(
+                sub_sitemap_url, timeout=15, follow_redirects=True,
+                headers=headers,
+            )
+
+            if response.status_code == 304:
+                if cached is not None:
+                    self._log(
+                        "debug",
+                        "Sub-sitemap not modified (304), reusing cached URL list: {url}",
+                        params={"url": sub_sitemap_url}, tag="URL_SEED")
+                    return list(cached["urls"])
+
+                # 304 without a locally cached body — fall back to a plain fetch.
+                self._log(
+                    "warning",
+                    "Sub-sitemap {url} returned 304 without a cached list; refetching",
+                    params={"url": sub_sitemap_url}, tag="URL_SEED")
+                response = await self.client.get(
+                    sub_sitemap_url, timeout=15, follow_redirects=True)
+
+            response.raise_for_status()
+
+            data = response.content
+            if sub_sitemap_url.endswith(".gz"):
+                data = gzip.decompress(data)
+
+            nested_indexes, page_urls = self._parse_sitemap_entries(
+                data, str(response.url))
+            if nested_indexes:
+                # This mode is defined for indexes whose children list page
+                # URLs directly; a nested index is a precondition violation,
+                # so keep the stale list instead of silently wiping it.
+                raise ValueError(
+                    "sub-sitemap is itself a sitemap index; conditional "
+                    "refresh expects a urlset that lists page URLs directly")
+
+            etag = response.headers.get("etag")
+            last_modified = response.headers.get("last-modified")
+            # Whole-list replacement, including empty lists.
+            _write_sub_sitemap_cache(
+                cache_path, sub_sitemap_url, page_urls, etag, last_modified)
+            self._log(
+                "info", "Refreshed sub-sitemap {url}: {count} URLs",
+                params={"url": sub_sitemap_url, "count": len(page_urls)},
+                tag="URL_SEED")
+            return page_urls
+
+        except Exception as e:
+            self._log(
+                "warning",
+                "Failed to refresh sub-sitemap {url}: {error}. "
+                "Reusing the previous URL list when available.",
+                params={"url": sub_sitemap_url, "error": str(e)},
+                tag="URL_SEED")
+            if cached is not None:
+                return list(cached["urls"])
+            return []
+
+    async def _from_sitemap_index_conditional(
+        self,
+        index_url: str,
+        sub_sitemaps: List[str],
+        force: bool = False,
+    ):
+        """
+        Conditionally refresh every child currently listed by a sitemap index.
+
+        Only children present in ``sub_sitemaps`` are requested, so sub-sitemaps
+        removed from the index no longer contribute URLs (their cache files are
+        pruned as well). Per-child failures never abort the run; the merged,
+        de-duplicated URLs are yielded in index order.
+        """
+        cache_dir = self._sub_sitemap_cache_dir(index_url)
+        cache_files = {
+            sm: self._sub_sitemap_cache_file(cache_dir, sm)
+            for sm in sub_sitemaps
+        }
+        current_names = {p.name for p in cache_files.values()}
+
+        # Drop caches of children the index no longer lists.
+        if not force:
+            for stale_path in cache_dir.glob("*.json"):
+                if stale_path.name not in current_names:
+                    try:
+                        stale_path.unlink()
+                    except OSError:
+                        pass
+
+        concurrency = max(
+            1, min(int(getattr(self, "_seed_concurrency", 100) or 100),
+                   len(sub_sitemaps)))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        self._log(
+            "info",
+            "Conditionally refreshing {count} sub-sitemaps of {index_url}",
+            params={"count": len(sub_sitemaps), "index_url": index_url},
+            tag="URL_SEED")
+
+        async def _refresh(sm: str) -> List[str]:
+            async with semaphore:
+                return await self._refresh_sub_sitemap(
+                    sm, cache_files[sm], force)
+
+        # gather() preserves the index's child ordering; failures are already
+        # converted into stale/empty lists inside _refresh_sub_sitemap.
+        child_results = await asyncio.gather(
+            *[_refresh(sm) for sm in sub_sitemaps])
+
+        seen: set = set()
+        for urls in child_results:
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    yield u
+
+    async def _discover_sitemap_urls_conditional(
+        self,
+        sitemap_url: str,
+        force: bool = False,
+    ):
+        """
+        Fetch a sitemap reference (e.g. one discovered via robots.txt) and
+        conditionally refresh its children when it is a sitemap index, or
+        yield its page URLs directly when it is a plain urlset.
+        """
+        r = await self.client.get(sitemap_url, timeout=15, follow_redirects=True)
+        r.raise_for_status()
+        data = gzip.decompress(r.content) if sitemap_url.endswith(".gz") else r.content
+        sub_sitemaps, page_urls = self._parse_sitemap_entries(data, str(r.url))
+
+        if sub_sitemaps:
+            async for u in self._from_sitemap_index_conditional(
+                    str(r.url), sub_sitemaps, force):
+                yield u
+        else:
+            for u in page_urls:
                 yield u
 
     # ─────────────────────────────── validate helpers

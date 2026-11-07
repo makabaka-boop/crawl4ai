@@ -2635,6 +2635,7 @@ class SeedingConfig:
         filter_nonsense_urls: bool = True,
         cache_ttl_hours: int = 24,
         validate_sitemap_lastmod: bool = True,
+        sitemap_conditional_refresh: bool = False,
     ):
         """
         Initialize URL seeding configuration.
@@ -2674,6 +2675,17 @@ class SeedingConfig:
                             (only lastmod validation). Default: 24
             validate_sitemap_lastmod: If True, compares sitemap's <lastmod> with cache
                                      timestamp and refetches if sitemap is newer. Default: True
+            sitemap_conditional_refresh: For sitemap indexes whose child sitemaps directly
+                                        list page URLs. When True, the index is fetched on
+                                        every discovery run and each currently-listed child
+                                        is revalidated with conditional requests
+                                        (If-None-Match/If-Modified-Since). 304 responses
+                                        reuse the child's cached URL list, 200 responses
+                                        replace the whole list (even if empty), children
+                                        removed from the index stop contributing URLs, and
+                                        failed children fall back to their previous list
+                                        with a warning. force=True still bypasses all caches.
+                                        Default: False
         """
         self.source = source
         self.pattern = pattern
@@ -2692,6 +2704,7 @@ class SeedingConfig:
         self.filter_nonsense_urls = filter_nonsense_urls
         self.cache_ttl_hours = cache_ttl_hours
         self.validate_sitemap_lastmod = validate_sitemap_lastmod
+        self.sitemap_conditional_refresh = sitemap_conditional_refresh
 
     # Add to_dict, from_kwargs, and clone methods for consistency
     def to_dict(self) -> Dict[str, Any]:
