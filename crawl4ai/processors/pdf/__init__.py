@@ -5,7 +5,7 @@ from crawl4ai.async_logger import AsyncLogger
 from crawl4ai.async_crawler_strategy import AsyncCrawlerStrategy
 from crawl4ai.models import AsyncCrawlResponse, ScrapingResult 
 from crawl4ai.content_scraping_strategy import ContentScrapingStrategy
-from .processor import NaivePDFProcessorStrategy  # Assuming your current PDF code is in pdf_processor.py
+from .processor import NaivePDFProcessorStrategy, PDFBookmarkPathError  # Assuming your current PDF code is in pdf_processor.py
 
 # Default resource bounds for remote PDF fetches. These cap what an untrusted
 # caller can make the process download and parse; see set_url_validator() for
@@ -84,6 +84,13 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
         save_images_locally (bool): Whether to save images locally.
         extract_images (bool): Whether to extract images from PDF.
         image_save_dir (str): Directory to save extracted images.
+        bookmark_path (list[str]): Optional list of bookmark/outline titles
+            identifying a single chapter, matched exactly level by level (e.g.
+            ``["User Guide", "Networking", "Wi-Fi Setup"]``). When given, only
+            the pages of that chapter are extracted, starting at the matched
+            bookmark's page and ending just before the next same- or higher-
+            level bookmark (or the document end). ``None`` processes the whole
+            PDF from page 1.
         logger (AsyncLogger): Logger instance for recording events and errors.
         
     Methods:
@@ -109,6 +116,7 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
                  max_pdf_bytes: int = DEFAULT_MAX_PDF_BYTES,
                  max_pdf_pages: int = DEFAULT_MAX_PDF_PAGES,
                  max_redirects: int = DEFAULT_MAX_REDIRECTS,
+                 bookmark_path=None,
                  logger: AsyncLogger = None,
                  url_validator=None):
         self.logger = logger
@@ -124,7 +132,8 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
             extract_images=extract_images,
             image_save_dir=image_save_dir,
             batch_size=batch_size,
-            max_pages=max_pdf_pages
+            max_pages=max_pdf_pages,
+            bookmark_path=bookmark_path,
         )
         self._temp_files = []  # Track temp files for cleanup
 
@@ -147,13 +156,15 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
             # result = self.pdf_processor.process(Path(pdf_path))
             result = self.pdf_processor.process_batch(Path(pdf_path))
             
-            # Combine page HTML
+            # Combine page HTML. data-page keeps each page's original number in
+            # the source PDF; when a bookmark path selects a chapter the first
+            # retained page is therefore not necessarily page 1.
             cleaned_html = f"""
         <html>
             <head><meta name="pdf-pages" content="{len(result.pages)}"></head>
             <body>
-                {''.join(f'<div class="pdf-page" data-page="{i+1}">{page.html}</div>'
-                         for i, page in enumerate(result.pages))}
+                {''.join(f'<div class="pdf-page" data-page="{page.page_number}">{page.html}</div>'
+                         for page in result.pages)}
             </body>
         </html>
         """
@@ -357,4 +368,4 @@ class PDFContentScrapingStrategy(ContentScrapingStrategy):
         return url  # Assume local path
     
 
-__all__ = ["PDFCrawlerStrategy", "PDFContentScrapingStrategy"]
+__all__ = ["PDFCrawlerStrategy", "PDFContentScrapingStrategy", "PDFBookmarkPathError"]

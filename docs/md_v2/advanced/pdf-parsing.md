@@ -98,6 +98,7 @@ When initializing `PDFContentScrapingStrategy`, you can configure its behavior u
 -   **`save_images_locally: bool = False`**: If `True` (and `extract_images` is also `True`), extracted images will be saved to disk in the `image_save_dir`. If `False`, image data might be available in another form (e.g., base64, depending on the underlying processor) but not saved as separate files by this strategy.
 -   **`image_save_dir: str = None`**: Specifies the directory where extracted images should be saved if `save_images_locally` is `True`. If `None`, a default or temporary directory might be used.
 -   **`batch_size: int = 4`**: Defines how many PDF pages are processed in a single batch. This can be useful for managing memory when dealing with very large PDF documents.
+-   **`bookmark_path: list[str] = None`**: Optional path of PDF outline (bookmark) titles identifying a single chapter, matched **exactly** level by level — e.g. `["User Guide", "Networking", "Wi-Fi Setup"]`. When set, extraction starts on the matched bookmark's page and ends just before the next bookmark at the same or a higher outline level (or at the end of the document when there is no boundary). See [Chapter extraction by bookmark path](#chapter-extraction-by-bookmark-path). `None` (the default) processes the PDF from the first page as usual.
 -   **`logger: AsyncLogger = None`**: An optional `AsyncLogger` instance for logging.
 
 ### Key Methods and Their Behavior
@@ -187,6 +188,40 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+### Chapter extraction by bookmark path
+
+Manual page numbers shift between revisions: a chapter on page 42 of one manual version may start on page 47 of the next. Instead of guessing offsets, `bookmark_path` selects a chapter structurally from the PDF's outline (bookmarks). Pass the chapter's titles as a path, one entry per outline level; each entry is matched **exactly** (case-sensitive string equality) against the bookmark title at that level under the previously matched parent.
+
+```python
+pdf_scraping_cfg = PDFContentScrapingStrategy(
+    # Top-level "User Guide" -> its child "Networking" -> its child "Wi-Fi Setup"
+    bookmark_path=["User Guide", "Networking", "Wi-Fi Setup"],
+)
+```
+
+The same option exists on `NaivePDFProcessorStrategy(bookmark_path=[...])` when you use the processor directly.
+
+**Which pages are kept**
+
+- Extraction starts on the matched bookmark's page and includes every full page up to, but not including, the page of the first *later* bookmark at the same outline level or a higher level. Bookmarks nested deeper inside the chapter never end it.
+- If that boundary bookmark lands on the same page as the matched bookmark, the shared page is kept (the chapter is a single page).
+- If no such boundary bookmark exists, extraction runs to the last page of the PDF.
+- `max_pages` (or `max_pdf_pages` on the scraping strategy) is counted from the chapter start page and applies only to the retained pages.
+- When image extraction/saving is enabled, only images from retained pages are processed or saved.
+
+**Output shape**
+
+- Retained pages are returned in their original document order and keep their original PDF page numbers (`page.page_number` and the `data-page` attribute in the produced HTML).
+- `metadata["pages"]` still reports the total page count of the whole PDF, not the chapter length.
+
+**Errors** — a `PDFBookmarkPathError` (a `ValueError` subclass, importable from `crawl4ai.processors.pdf`) is raised when:
+
+- no bookmark matches a title at some level (path not found);
+- more than one bookmark matches a title at the same level (ambiguous match);
+- the matched or boundary bookmark does not resolve to a valid page in the document.
+
+When `bookmark_path` is `None` (or an empty list), behaviour is unchanged: processing starts at page 1.
 
 ### Pros and Cons
 

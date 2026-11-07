@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from time import time
 from dataclasses import dataclass, asdict, field
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Sequence, Tuple
 import base64
 import tempfile
 from .utils import *
@@ -20,6 +20,16 @@ from .utils import (
 # from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
+
+
+class PDFBookmarkPathError(ValueError):
+    """Raised when a bookmark_path cannot select exactly one chapter.
+
+    Covers the three failure modes callers can act on:
+      * no bookmark matches a title at some level (path not found)
+      * several bookmarks match a title at the same level (ambiguous)
+      * a matched/boundary bookmark does not resolve to a valid page
+    """
 
 @dataclass
 class PDFMetadata:
@@ -57,7 +67,7 @@ class PDFProcessorStrategy(ABC):
 class NaivePDFProcessorStrategy(PDFProcessorStrategy):
     def __init__(self, image_dpi: int = 144, image_quality: int = 85, extract_images: bool = True,
                  save_images_locally: bool = False, image_save_dir: Optional[Path] = None, batch_size: int = 4,
-                 max_pages: Optional[int] = None):
+                 max_pages: Optional[int] = None, bookmark_path: Optional[Sequence[str]] = None):
         # Import check at initialization time
         try:
             import pypdf
@@ -74,7 +84,32 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
         # opening a file they chose. Callers accepting untrusted PDFs (the
         # Docker server) pass a cap so page count can't be used to burn CPU.
         self.max_pages = max_pages
+        # Optional outline (bookmark) path, e.g. ["User Guide", "Networking",
+        # "Wi-Fi Setup"]. Each entry must match a bookmark title exactly, at the
+        # corresponding outline depth. When set, only the pages of the selected
+        # chapter are processed (see _resolve_page_range). None/empty keeps the
+        # original "process from page 1" behaviour.
+        self.bookmark_path = self._validate_bookmark_path(bookmark_path)
         self._temp_dir = None
+
+    @staticmethod
+    def _validate_bookmark_path(bookmark_path: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
+        if bookmark_path is None:
+            return None
+        # A bare str would otherwise be silently iterated into single chars.
+        if isinstance(bookmark_path, str) or not isinstance(bookmark_path, (list, tuple)):
+            raise TypeError(
+                "bookmark_path must be a sequence of bookmark title strings, "
+                f"got {type(bookmark_path).__name__}"
+            )
+        if len(bookmark_path) == 0:
+            return None
+        for level, title in enumerate(bookmark_path):
+            if not isinstance(title, str) or not title:
+                raise ValueError(
+                    f"bookmark_path title at level {level + 1} must be a non-empty string"
+                )
+        return tuple(bookmark_path)
 
     def _page_limit(self, total_pages: int) -> int:
         """Number of pages to actually process, honouring max_pages."""
@@ -87,6 +122,158 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                 f"(max_pages={self.max_pages})"
             )
         return capped
+
+    # ── bookmark (outline) based chapter selection ───────────────────────
+
+    @staticmethod
+    def _flatten_outline(reader) -> List[Tuple[Any, int]]:
+        """Flatten the PDF outline into ``(bookmark, depth)`` tuples.
+
+        pypdf exposes ``reader.outline`` as a nested list: a bookmark is a
+        ``Destination`` and the list immediately following it holds its
+        children. Flattening in document order turns that nesting into depths.
+        """
+        flat: List[Tuple[Any, int]] = []
+
+        def walk(items, depth):
+            for item in items:
+                if isinstance(item, list):
+                    walk(item, depth + 1)
+                elif getattr(item, "title", None) is not None:
+                    flat.append((item, depth))
+
+        outline = getattr(reader, "outline", None)
+        if outline:
+            walk(outline, 0)
+        return flat
+
+    def _match_bookmark_path(
+        self, flat_outline: List[Tuple[Any, int]]
+    ) -> int:
+        """Find the unique bookmark matching ``self.bookmark_path``.
+
+        Each path entry is matched against a bookmark title exactly (string
+        equality) at the depth of its level, restricted to the subtree of the
+        previously matched parent. Returns the index in ``flat_outline``.
+        """
+        path = self.bookmark_path
+        search_start = 0
+        matched_index = -1
+
+        for level, wanted_title in enumerate(path):
+            candidates = []
+            i = search_start
+            while i < len(flat_outline):
+                bookmark, depth = flat_outline[i]
+                # A node shallower than the level we are matching closes the
+                # parent subtree (depth can never be negative at level 0).
+                if depth < level:
+                    break
+                if depth == level and bookmark.title == wanted_title:
+                    candidates.append(i)
+                i += 1
+
+            breadcrumb = " > ".join(path[:level]) or "<outline root>"
+            if not candidates:
+                raise PDFBookmarkPathError(
+                    f"Bookmark path not found at level {level + 1}: no bookmark "
+                    f"titled {wanted_title!r} under {breadcrumb!r}"
+                )
+            if len(candidates) > 1:
+                raise PDFBookmarkPathError(
+                    f"Bookmark path matches {len(candidates)} bookmarks at level "
+                    f"{level + 1} for title {wanted_title!r} under {breadcrumb!r}; "
+                    "refusing to pick one ambiguously"
+                )
+
+            matched_index = candidates[0]
+            search_start = matched_index + 1
+
+        return matched_index
+
+    def _bookmark_page_number(
+        self, reader, bookmark, total_pages: int, *, role: str
+    ) -> int:
+        """Resolve a bookmark to a 0-based page index, validating the result."""
+        title = getattr(bookmark, "title", "<untitled>")
+        try:
+            page_index = reader.get_destination_page_number(bookmark)
+        except Exception as e:
+            raise PDFBookmarkPathError(
+                f"Bookmark {title!r} ({role}) does not resolve to a page: {e}"
+            ) from e
+
+        if not isinstance(page_index, int) or not (0 <= page_index < total_pages):
+            raise PDFBookmarkPathError(
+                f"Bookmark {title!r} ({role}) points to invalid page "
+                f"{page_index!r}; document has {total_pages} pages"
+            )
+        return page_index
+
+    def _resolve_page_range(self, reader) -> Optional[Tuple[int, int]]:
+        """Return ``(start_index, end_index_exclusive)`` for bookmark_path.
+
+        Returns ``None`` when no bookmark path was configured (original
+        behaviour: process from the first page).
+
+        The chapter starts on the page of the matched bookmark and runs to the
+        page before the first later bookmark at the same or a higher (shallower)
+        outline level. If that boundary bookmark shares the start page, the
+        shared page is kept. With no boundary the chapter runs to the end.
+        ``max_pages`` is counted from the chapter start page.
+        """
+        if not self.bookmark_path:
+            return None
+
+        total_pages = len(reader.pages)
+        flat_outline = self._flatten_outline(reader)
+        if not flat_outline:
+            raise PDFBookmarkPathError(
+                "PDF has no bookmarks/outline; cannot resolve bookmark_path "
+                f"{list(self.bookmark_path)!r}"
+            )
+
+        matched_index = self._match_bookmark_path(flat_outline)
+        matched_bookmark, matched_depth = flat_outline[matched_index]
+        start_index = self._bookmark_page_number(
+            reader, matched_bookmark, total_pages, role="chapter start"
+        )
+
+        # First later bookmark at the same level or higher (shallower) ends it.
+        boundary_bookmark = None
+        for i in range(matched_index + 1, len(flat_outline)):
+            if flat_outline[i][1] <= matched_depth:
+                boundary_bookmark = flat_outline[i][0]
+                break
+
+        if boundary_bookmark is None:
+            end_index = total_pages
+        else:
+            boundary_page = self._bookmark_page_number(
+                reader, boundary_bookmark, total_pages, role="chapter boundary"
+            )
+            if boundary_page < start_index:
+                raise PDFBookmarkPathError(
+                    f"Chapter boundary bookmark {boundary_bookmark.title!r} is on "
+                    f"page {boundary_page + 1}, before the matched chapter start "
+                    f"page {start_index + 1}"
+                )
+            # boundary_page is exclusive; when both bookmarks share a page keep
+            # that page instead of producing an empty chapter.
+            end_index = max(start_index + 1, boundary_page)
+
+        # max_pages is counted from the chapter start page and only retained
+        # pages are ever processed.
+        retained = end_index - start_index
+        if self.max_pages is not None and retained > self.max_pages:
+            logger.warning(
+                f"Bookmarked chapter spans {retained} pages starting at page "
+                f"{start_index + 1}; processing first {self.max_pages} "
+                f"(max_pages={self.max_pages})"
+            )
+            end_index = start_index + self.max_pages
+
+        return start_index, end_index
 
     def process(self, pdf_path: Path) -> PDFProcessResult:
         # Import inside method to allow dependency to be optional
@@ -105,6 +292,9 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
         try:
             with pdf_path.open('rb') as file:
                 reader = PdfReader(file)
+                # Metadata is always extracted from the whole document, so it
+                # keeps reporting the full page count even when a single
+                # chapter is processed.
                 result.metadata = self._extract_metadata(pdf_path, reader)
                 
                 # Handle image directory
@@ -117,10 +307,17 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                         self._temp_dir = tempfile.mkdtemp(prefix='pdf_images_')
                         image_dir = Path(self._temp_dir)
 
-                page_limit = self._page_limit(len(reader.pages))
-                for page_num, page in enumerate(reader.pages):
-                    if page_num >= page_limit:
-                        break
+                # None bookmark path -> process from page 1 as before.
+                page_range = self._resolve_page_range(reader)
+                if page_range is None:
+                    start_index, end_index = 0, self._page_limit(len(reader.pages))
+                else:
+                    start_index, end_index = page_range
+
+                for page_num in range(start_index, end_index):
+                    page = reader.pages[page_num]
+                    # Keep the original (document-wide) 1-based page number so
+                    # HTML page markers and per-page formatting stay accurate.
                     pdf_page = self._process_page(page, image_dir, page_num + 1)
                     result.pages.append(pdf_page)
 
@@ -166,8 +363,16 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
             # Get metadata and page count from main thread
             with pdf_path.open('rb') as file:
                 reader = PdfReader(file)
+                # Metadata always reflects the whole document, even when a
+                # bookmark path restricts which pages are processed.
                 result.metadata = self._extract_metadata(pdf_path, reader)
-                total_pages = self._page_limit(len(reader.pages))
+                page_range = self._resolve_page_range(reader)
+                if page_range is None:
+                    start_index, end_index = 0, self._page_limit(len(reader.pages))
+                else:
+                    start_index, end_index = page_range
+
+            page_indices = list(range(start_index, end_index))
 
             # Handle image directory setup
             image_dir = None
@@ -184,23 +389,25 @@ class NaivePDFProcessorStrategy(PDFProcessorStrategy):
                 with pdf_path.open('rb') as file:
                     thread_reader = PdfReader(file)
                     page = thread_reader.pages[page_num]
+                    # Document-wide 1-based page number, preserved even when a
+                    # bookmark path skips earlier pages.
                     return self._process_page(page, image_dir, page_num + 1)
 
             # Process pages in parallel batches
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.batch_size) as executor:
                 futures = []
-                for page_num in range(total_pages):
+                for page_num in page_indices:
                     future = executor.submit(process_page_safely, page_num)
-                    futures.append((page_num + 1, future))
+                    futures.append((page_num, future))
 
-                # Collect results in order
-                result.pages = [None] * total_pages
-                for page_num, future in futures:
+                # Collect results in document order (absolute page index order)
+                result.pages = [None] * len(page_indices)
+                for position, (page_num, future) in enumerate(futures):
                     try:
                         pdf_page = future.result()
-                        result.pages[page_num - 1] = pdf_page
+                        result.pages[position] = pdf_page
                     except Exception as e:
-                        logger.error(f"Failed to process page {page_num}: {str(e)}")
+                        logger.error(f"Failed to process page {page_num + 1}: {str(e)}")
                         raise
 
         except Exception as e:
