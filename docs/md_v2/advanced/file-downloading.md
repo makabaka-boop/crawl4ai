@@ -108,6 +108,42 @@ os.makedirs(download_path, exist_ok=True)
 asyncio.run(download_multiple_files("https://www.python.org/downloads/windows/", download_path))
 ```
 
+## Binary Attachment Size Limit (HTTP Strategy)
+
+When crawling with `AsyncHTTPCrawlerStrategy` / `HTTPCrawlerConfig`, you can set
+`max_file_size` (in bytes) to cap the size of a single binary attachment (PDFs,
+archives, images, and other non-text downloads):
+
+```python
+from crawl4ai import AsyncWebCrawler
+from crawl4ai.async_crawler_strategy import AsyncHTTPCrawlerStrategy
+from crawl4ai.async_configs import HTTPCrawlerConfig, CrawlerRunConfig
+
+http_strategy = AsyncHTTPCrawlerStrategy(
+    browser_config=HTTPCrawlerConfig(max_file_size=10 * 1024 * 1024)  # 10 MiB
+)
+
+async with AsyncWebCrawler(crawler_strategy=http_strategy) as crawler:
+    result = await crawler.arun(url="https://example.com/report.pdf")
+```
+
+Behavior when the cap is configured:
+
+- Binary attachments are streamed to disk as they arrive instead of being
+  buffered fully in memory. The cap is measured against the **decompressed**
+  payload bytes (gzip/deflate/br are expanded), i.e. the bytes actually written.
+- The download lands in a temporary file and is only published under its final
+  filename (and returned in `downloaded_files`) once the complete payload was
+  received within the limit.
+- If the payload exceeds the cap, reading stops immediately, the crawl fails
+  with an error message stating the size limit was exceeded, and the unfinished
+  temporary file is removed. A pre-existing file with the same name is kept.
+- Interrupted transfers and save failures are reported the same way, with the
+  unfinished file cleaned up.
+
+HTML pages, text-based attachments (CSV, JSON, plain text, etc.) and crawls
+without `max_file_size` keep their original, fully buffered behavior.
+
 ## Important Considerations
 
 - **Browser Context:** Downloads are managed within the browser context. Ensure `js_code` correctly targets the download triggers on the webpage.

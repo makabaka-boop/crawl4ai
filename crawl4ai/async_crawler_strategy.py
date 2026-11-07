@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 import hashlib
 import random
 import re
+import tempfile
 import uuid
 from .js_snippet import load_js_script
 from .models import AsyncCrawlResponse
@@ -2498,6 +2499,22 @@ class HTTPStatusError(HTTPCrawlerError):
         super().__init__(f"HTTP {status_code}: {message}")
 
 
+class DownloadSizeLimitError(HTTPCrawlerError):
+    """Raised when a streamed attachment grows past ``max_file_size``.
+
+    The size is measured on the decompressed payload bytes actually written to
+    disk, not on the (possibly compressed) on-the-wire Content-Length.
+    """
+    def __init__(self, filename: str, limit: int, received: int):
+        self.filename = filename
+        self.limit = limit
+        self.received = received
+        super().__init__(
+            f"Download aborted: attachment {filename!r} exceeds the maximum "
+            f"file size limit of {limit} bytes ({received} bytes received)"
+        )
+
+
 class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
     """
     Fast, lightweight HTTP-only crawler strategy optimized for memory efficiency.
@@ -2749,6 +2766,106 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
         ext = ext_map.get(content_type, '')
         return f"download_{hashlib.md5(url.encode()).hexdigest()[:10]}{ext}"
 
+    async def _stream_binary_attachment(
+        self,
+        response: "aiohttp.ClientResponse",
+        *,
+        url: str,
+        content_type: str,
+        content_disposition: str,
+        max_file_size: int,
+        proxy_url: Optional[str] = None,
+    ) -> str:
+        """Stream a binary attachment to disk while enforcing a size cap.
+
+        The response body is written to a unique temp file inside the
+        downloads directory as it arrives (never buffered in memory) and only
+        renamed to the final filename once the complete, in-limit payload is
+        on disk. Byte accounting uses the decompressed chunks aiohttp yields
+        (gzip/deflate/br are already expanded), i.e. it measures the bytes
+        that would actually be written.
+
+        On oversize, transfer interruption, or save failure the temp file is
+        removed and an error propagates; any pre-existing file at the final
+        path is preserved because the rename only happens on full success.
+        """
+        downloads_path = self.browser_config.downloads_path or os.path.join(
+            os.path.expanduser("~"), ".crawl4ai", "downloads"
+        )
+        os.makedirs(downloads_path, exist_ok=True)
+
+        filename = self._extract_filename(content_disposition, url, content_type)
+        final_path = _safe_download_filepath(downloads_path, filename)
+        real_root = os.path.realpath(downloads_path)
+
+        # mkstemp creates the temp file atomically (O_CREAT|O_EXCL, 0600)
+        # inside the confined root — no symlink or traversal can hijack it.
+        # Cap the name component so a 255-char filename can't blow NAME_MAX.
+        prefix = f".{os.path.basename(final_path)[:180]}."
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=real_root, prefix=prefix, suffix=".part"
+            )
+        except OSError as e:
+            raise HTTPCrawlerError(
+                f"Failed to prepare download for {filename!r}: {e}"
+            )
+
+        bytes_written = 0
+        try:
+            try:
+                async with aiofiles.open(tmp_fd, mode="wb", closefd=True) as f:
+                    # iter_chunked yields post-decompression payload bytes.
+                    async for chunk in response.content.iter_chunked(self.chunk_size):
+                        if not chunk:
+                            continue
+                        bytes_written += len(chunk)
+                        if bytes_written > max_file_size:
+                            # Stop fetching and drop the connection at once
+                            # instead of draining the oversized remainder.
+                            response.close()
+                            raise DownloadSizeLimitError(
+                                filename, max_file_size, bytes_written
+                            )
+                        await f.write(chunk)
+            except DownloadSizeLimitError:
+                raise
+            except (aiohttp.ServerTimeoutError, asyncio.exceptions.TimeoutError) as e:
+                raise self._wrap_error(
+                    ConnectionTimeoutError, "Download timed out", e, proxy_url
+                )
+            except aiohttp.ClientError as e:
+                raise self._wrap_error(
+                    HTTPCrawlerError, "Download interrupted", e, proxy_url
+                )
+            except OSError as e:
+                raise HTTPCrawlerError(
+                    f"Failed to save attachment {filename!r}: {e}"
+                )
+
+            # Complete and within the cap: publish under the final name.
+            try:
+                os.replace(tmp_path, final_path)
+            except OSError as e:
+                raise HTTPCrawlerError(
+                    f"Failed to finalize attachment {filename!r}: {e}"
+                )
+            return final_path
+        finally:
+            # Reachable only for an unfinished download: after a successful
+            # os.replace the temp path no longer exists.
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if self.logger:
+                    self.logger.warning(
+                        message="Could not remove unfinished download {path}",
+                        tag="DOWNLOAD",
+                        params={"path": tmp_path},
+                    )
+
     async def _handle_http(
         self,
         url: str,
@@ -2790,6 +2907,48 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
 
             try:
                 async with session.request(self.browser_config.method, url, **request_kwargs) as response:
+                    response_headers = dict(response.headers)
+                    content_type = response.content_type or 'text/html'
+                    content_type = content_type.split(';')[0].strip().lower()
+                    content_disposition = response_headers.get('Content-Disposition', '')
+                    max_file_size = self.browser_config.max_file_size
+
+                    # Optional capped path for binary attachments only: stream
+                    # to a temp file as bytes arrive (counting decompressed
+                    # bytes) and publish the final name only when the complete
+                    # payload fits under the cap. HTML pages, text attachments
+                    # and uncapped crawls all keep the buffered flow below.
+                    if (
+                        max_file_size is not None
+                        and self._is_file_download(content_type, content_disposition)
+                        and not self._is_text_content(content_type)
+                    ):
+                        if not (200 <= response.status < 300):
+                            raise HTTPStatusError(
+                                response.status,
+                                f"Unexpected status code for {url}"
+                            )
+
+                        filepath = await self._stream_binary_attachment(
+                            response,
+                            url=url,
+                            content_type=content_type,
+                            content_disposition=content_disposition,
+                            max_file_size=max_file_size,
+                            proxy_url=proxy_url,
+                        )
+
+                        result = AsyncCrawlResponse(
+                            html="",
+                            response_headers=response_headers,
+                            status_code=response.status,
+                            redirected_url=str(response.url),
+                            downloaded_files=[filepath],
+                        )
+
+                        await self.hooks['after_request'](result)
+                        return result
+
                     raw_bytes = await response.read()
                     content = memoryview(raw_bytes)
 
@@ -2798,11 +2957,6 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
                             response.status,
                             f"Unexpected status code for {url}"
                         )
-
-                    response_headers = dict(response.headers)
-                    content_type = response.content_type or 'text/html'
-                    content_type = content_type.split(';')[0].strip().lower()
-                    content_disposition = response_headers.get('Content-Disposition', '')
 
                     downloaded_files = None
                     html = ""
@@ -2848,6 +3002,12 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
                     await self.hooks['after_request'](result)
                     return result
 
+            except DownloadSizeLimitError as e:
+                # Preserve the typed, explicit size-limit explanation instead
+                # of masking it behind the generic "HTTP request failed" wrap.
+                await self.hooks['on_error'](e)
+                raise
+
             except aiohttp.ServerTimeoutError as e:
                 await self.hooks['on_error'](e)
                 raise self._wrap_error(ConnectionTimeoutError, "Request timed out", e, proxy_url)
@@ -2863,7 +3023,14 @@ class AsyncHTTPCrawlerStrategy(AsyncCrawlerStrategy):
             except asyncio.exceptions.TimeoutError as e:
                 await self.hooks['on_error'](e)
                 raise self._wrap_error(ConnectionTimeoutError, "Request timed out", e, proxy_url)
-            
+
+            except HTTPCrawlerError as e:
+                # Typed failures produced while streaming an attachment
+                # (interrupted transfer, save failure, download timeout)
+                # already carry a clear message — report it as-is.
+                await self.hooks['on_error'](e)
+                raise
+
             except Exception as e:
                 await self.hooks['on_error'](e)
                 raise self._wrap_error(HTTPCrawlerError, "HTTP request failed", e, proxy_url)

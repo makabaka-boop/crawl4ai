@@ -1519,6 +1519,7 @@ class HTTPCrawlerConfig:
     follow_redirects: bool = True
     verify_ssl: bool = True
     downloads_path: Optional[str] = None
+    max_file_size: Optional[int] = None
 
     def __init__(
         self,
@@ -1529,6 +1530,7 @@ class HTTPCrawlerConfig:
         follow_redirects: bool = True,
         verify_ssl: bool = True,
         downloads_path: Optional[str] = None,
+        max_file_size: Optional[int] = None,
     ):
         self.method = method
         self.headers = headers
@@ -1537,6 +1539,17 @@ class HTTPCrawlerConfig:
         self.follow_redirects = follow_redirects
         self.verify_ssl = verify_ssl
         self.downloads_path = downloads_path
+        # Optional per-file size cap (in bytes) for binary attachments fetched
+        # over HTTP. When set, such attachments are streamed straight to disk
+        # and aborted as soon as their decompressed payload exceeds the cap.
+        # None (the default) keeps the buffered, whole-response behavior.
+        if max_file_size is not None and (
+            isinstance(max_file_size, bool)
+            or not isinstance(max_file_size, int)
+            or max_file_size <= 0
+        ):
+            raise ValueError("max_file_size must be a positive integer (bytes) or None")
+        self.max_file_size = max_file_size
 
     @staticmethod
     def from_kwargs(kwargs: dict) -> "HTTPCrawlerConfig":
@@ -1548,6 +1561,7 @@ class HTTPCrawlerConfig:
             follow_redirects=kwargs.get("follow_redirects", True),
             verify_ssl=kwargs.get("verify_ssl", True),
             downloads_path=kwargs.get("downloads_path"),
+            max_file_size=kwargs.get("max_file_size"),
         )
 
     def to_dict(self):
@@ -1559,6 +1573,7 @@ class HTTPCrawlerConfig:
             "follow_redirects": self.follow_redirects,
             "verify_ssl": self.verify_ssl,
             "downloads_path": self.downloads_path,
+            "max_file_size": self.max_file_size,
         }
 
     def clone(self, **kwargs):
